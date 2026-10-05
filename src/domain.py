@@ -1,6 +1,11 @@
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Dict, Optional
+
+
+def utcnow():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
 class DomainError(Exception):

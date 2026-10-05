@@ -5,7 +5,12 @@ from .domain import (
     InvalidTransition,
     PermissionDenied,
     ValidationError,
+    utcnow,
 )
+
+
+# 用途受控词表：同意按用途登记，撤回时也按用途定向执行。
+PURPOSES = ("research", "genetic_analysis", "clinical", "teaching", "public_health")
 
 
 def _validate_participant(actor, data, lookup):
@@ -17,17 +22,32 @@ def _validate_consent(actor, data, lookup):
     participant = _find_one(lookup, "participant", "id", data.get("participant_id"))
     if not participant or participant["status"] == "closed":
         raise ValidationError("consent requires an active participant")
-    if not data.get("scope"):
+    scope = data.get("scope")
+    if not scope:
         raise ValidationError("consent scope is required")
+    if not isinstance(scope, list):
+        raise ValidationError("consent scope must be a list of purposes")
+    unknown = [p for p in scope if p not in PURPOSES]
+    if unknown:
+        raise ValidationError("unknown purpose: " + ", ".join(unknown))
 
 
 def _validate_sample_store(actor, entity, data, lookup):
     consent = _find_one(lookup, "consent", "id", data.get("consent_id"))
     if not consent or consent["status"] != "active":
         raise ValidationError("storage requires active consent")
-    if "research" not in consent["data"].get("scope", []):
-        raise ValidationError("consent does not include research use")
-    return {"stored_at": "2026-09-24T00:00:00Z"}
+    scope = consent["data"].get("scope", [])
+    # 样本入库时记下这次用到的用途：默认取同意覆盖的全部用途，也可显式指定子集。
+    purposes = data.get("purposes") or list(scope)
+    if not isinstance(purposes, list) or not purposes:
+        raise ValidationError("sample purposes are required")
+    unknown = [p for p in purposes if p not in PURPOSES]
+    if unknown:
+        raise ValidationError("unknown purpose: " + ", ".join(unknown))
+    missing = [p for p in purposes if p not in scope]
+    if missing:
+        raise ValidationError("consent does not cover purpose: " + ", ".join(missing))
+    return {"purposes": list(purposes), "stored_at": utcnow()}
 
 
 def _validate_withdrawal_approve(actor, entity, data, lookup):
@@ -37,6 +57,12 @@ def _validate_withdrawal_approve(actor, entity, data, lookup):
     for sample_id in samples:
         if not _find_one(lookup, "sample", "id", sample_id):
             raise ValidationError("unknown sample: " + str(sample_id))
+    purposes = data.get("purposes") or []
+    if not isinstance(purposes, list) or not purposes:
+        raise ValidationError("withdrawal purposes are required")
+    unknown = [p for p in purposes if p not in PURPOSES]
+    if unknown:
+        raise ValidationError("unknown purpose: " + ", ".join(unknown))
     return {"approved_by": actor.user_id}
 
 
@@ -47,9 +73,28 @@ CUSTOM_TRANSITIONS = {('sample', 'store'): _validate_sample_store, ('withdrawal'
 class RuleEngine:
     ALIASES = {'participants': 'participant', 'consents': 'consent', 'samples': 'sample', 'withdrawals': 'withdrawal'}
     INITIAL_STATUS = {'participant': 'registered', 'consent': 'draft', 'sample': 'collected', 'withdrawal': 'requested'}
-    TRANSITIONS = {'participant': {'close_participant': (('registered',), 'closed')}, 'consent': {'activate': (('draft',), 'active'), 'supersede': (('active',), 'superseded'), 'withdraw': (('active',), 'withdrawn')}, 'sample': {'store': (('collected',), 'stored'), 'loan': (('stored',), 'on_loan'), 'return': (('on_loan',), 'stored'), 'anonymize': (('stored',), 'anonymized'), 'destroy': (('stored',), 'destroyed')}, 'withdrawal': {'approve': (('requested',), 'approved'), 'execute': (('approved',), 'executed')}}
+    TRANSITIONS = {
+        'participant': {'close_participant': {'registered': 'closed'}},
+        'consent': {
+            'activate': {'draft': 'active'},
+            'supersede': {'active': 'superseded'},
+            'withdraw': {'active': 'withdrawn'},
+        },
+        'sample': {
+            'store': {'collected': 'stored'},
+            'loan': {'stored': 'on_loan'},
+            # 正常归还回到在库；撤回后召回的样本归还后转待处置。
+            'return': {'on_loan': 'stored', 'pending_recall': 'pending_disposal'},
+            'anonymize': {'stored': 'anonymized'},
+            'destroy': {'stored': 'destroyed', 'pending_disposal': 'destroyed'},
+        },
+        'withdrawal': {
+            'approve': {'requested': 'approved'},
+            'execute': {'approved': 'executed'},
+        },
+    }
     CREATE_REQUIRED = {'participant': ('name',), 'consent': ('participant_id', 'scope'), 'sample': ('participant_id', 'sample_code', 'collected_at'), 'withdrawal': ('participant_id', 'requested_at')}
-    ACTION_REQUIRED = {('consent', 'activate'): ('scope', 'version', 'expires_at'), ('consent', 'supersede'): ('reason',), ('consent', 'withdraw'): ('reason',), ('sample', 'store'): ('freezer', 'position', 'consent_id'), ('sample', 'loan'): ('recipient', 'purpose', 'due_at'), ('sample', 'anonymize'): ('reason',), ('sample', 'destroy'): ('reason',), ('withdrawal', 'approve'): ('reason', 'sample_ids'), ('withdrawal', 'execute'): ('executed_at',)}
+    ACTION_REQUIRED = {('consent', 'activate'): ('scope', 'version', 'expires_at'), ('consent', 'supersede'): ('reason',), ('consent', 'withdraw'): ('reason',), ('sample', 'store'): ('freezer', 'position', 'consent_id'), ('sample', 'loan'): ('recipient', 'purpose', 'due_at'), ('sample', 'anonymize'): ('reason',), ('sample', 'destroy'): ('reason',), ('withdrawal', 'approve'): ('reason', 'sample_ids', 'purposes'), ('withdrawal', 'execute'): ('executed_at',)}
     CREATE_ROLES = {'participant': ('admin', 'biobank'), 'consent': ('admin', 'committee'), 'sample': ('admin', 'biobank'), 'withdrawal': ('admin', 'biobank')}
     ROLE_ACTIONS = {'close_participant': ('admin', 'biobank'), 'activate': ('admin', 'committee'), 'supersede': ('admin', 'committee'), 'withdraw': ('admin', 'committee'), 'store': ('admin', 'biobank'), 'loan': ('admin', 'biobank'), 'return': ('admin', 'biobank'), 'anonymize': ('admin', 'biobank'), 'destroy': ('admin', 'biobank'), 'approve': ('admin', 'committee'), 'execute': ('admin', 'biobank')}
 
@@ -87,14 +132,14 @@ class RuleEngine:
 
     def validate_transition(self, actor, entity, action, data, lookup=None):
         kind = self.normalize_kind(entity["kind"])
-        transition = self.TRANSITIONS.get(kind, {}).get(action)
-        if not transition:
+        transitions = self.TRANSITIONS.get(kind, {}).get(action)
+        if not transitions:
             raise InvalidTransition("unknown action %s for %s" % (action, kind))
-        allowed_statuses, next_status = transition
-        if entity["status"] not in allowed_statuses:
+        if entity["status"] not in transitions:
             raise InvalidTransition(
                 "cannot %s from status %s" % (action, entity["status"])
             )
+        next_status = transitions[entity["status"]]
         allowed_roles = self.ROLE_ACTIONS.get(
             (kind, action), self.ROLE_ACTIONS.get(action, ("admin",))
         )

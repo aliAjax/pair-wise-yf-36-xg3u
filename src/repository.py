@@ -1,12 +1,7 @@
 import json
 import sqlite3
-from datetime import datetime, timezone
 
-from .domain import ConflictError, NotFoundError
-
-
-def utcnow():
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+from .domain import ConflictError, NotFoundError, utcnow
 
 
 class SQLiteRepository:
@@ -139,6 +134,63 @@ class SQLiteRepository:
         finally:
             connection.close()
         return self.get_entity(entity_id)
+
+    def apply_withdrawal(self, updates, audit_entries):
+        """Atomically apply consent scope reductions, sample status changes and
+        their audit records in a single write transaction.
+
+        ``updates`` is a list of ``(entity_id, expected_version, status, data)``.
+        Every entity is re-read under ``BEGIN IMMEDIATE`` and only updated when
+        its version still matches the one the decision was based on, so a
+        concurrent change (e.g. a sample loan) makes the whole withdrawal fail
+        with :class:`ConflictError` instead of partially applying.
+        """
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            for entity_id, expected_version, status, data in updates:
+                row = connection.execute(
+                    "SELECT version FROM entities WHERE id = ?", (entity_id,)
+                ).fetchone()
+                if not row:
+                    raise NotFoundError("entity not found: " + entity_id)
+                current_version = int(row["version"])
+                if expected_version is not None and current_version != int(expected_version):
+                    raise ConflictError(
+                        "version conflict: expected %s, found %s"
+                        % (expected_version, current_version)
+                    )
+                payload = json.dumps(data, ensure_ascii=False, sort_keys=True)
+                connection.execute(
+                    "UPDATE entities SET status = ?, version = version + 1, data = ?, updated_at = ? "
+                    "WHERE id = ? AND version = ?",
+                    (status, payload, utcnow(), entity_id, current_version),
+                )
+            for entry in audit_entries:
+                self._insert_audit(connection, *entry)
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    @staticmethod
+    def _insert_audit(connection, entity_id, actor_id, actor_role, action, from_status, to_status, detail):
+        connection.execute(
+            "INSERT INTO audit_log(entity_id, actor_id, actor_role, action, from_status, to_status, detail, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                entity_id,
+                actor_id,
+                actor_role,
+                action,
+                from_status,
+                to_status,
+                json.dumps(detail, ensure_ascii=False, sort_keys=True),
+                utcnow(),
+            ),
+        )
 
     def append_audit(self, entity_id, actor_id, actor_role, action, from_status, to_status, detail):
         with self._connect() as connection:
