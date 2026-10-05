@@ -1,5 +1,6 @@
 import json
 import sqlite3
+from contextlib import contextmanager
 from datetime import datetime, timezone
 
 from .domain import ConflictError, NotFoundError
@@ -7,6 +8,92 @@ from .domain import ConflictError, NotFoundError
 
 def utcnow():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+class Transaction:
+    """单连接工作单元：同一事务内完成多实体更新与审计写入。"""
+
+    def __init__(self, connection):
+        self.connection = connection
+
+    @staticmethod
+    def _row_to_entity(row):
+        return {
+            "id": row["id"],
+            "kind": row["kind"],
+            "status": row["status"],
+            "version": int(row["version"]),
+            "data": json.loads(row["data"]),
+            "created_by": row["created_by"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+
+    def get(self, entity_id):
+        row = self.connection.execute(
+            "SELECT * FROM entities WHERE id = ?", (entity_id,)
+        ).fetchone()
+        return self._row_to_entity(row) if row else None
+
+    def list(self, kind=None, status=None):
+        clauses = []
+        params = []
+        if kind:
+            clauses.append("kind = ?")
+            params.append(kind)
+        if status:
+            clauses.append("status = ?")
+            params.append(status)
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        rows = self.connection.execute(
+            "SELECT * FROM entities" + where + " ORDER BY created_at, id", params
+        ).fetchall()
+        return [self._row_to_entity(row) for row in rows]
+
+    def find(self, kind, field, value):
+        return [
+            entity
+            for entity in self.list(kind=kind)
+            if (entity["id"] == value if field == "id" else entity["data"].get(field) == value)
+        ]
+
+    def update(self, entity_id, expected_version, status, data):
+        payload = json.dumps(data, ensure_ascii=False, sort_keys=True)
+        row = self.connection.execute(
+            "SELECT version FROM entities WHERE id = ?", (entity_id,)
+        ).fetchone()
+        if not row:
+            raise NotFoundError("entity not found: " + entity_id)
+        current_version = int(row["version"])
+        if expected_version is not None and current_version != int(expected_version):
+            raise ConflictError(
+                "version conflict: expected %s, found %s"
+                % (expected_version, current_version)
+            )
+        cursor = self.connection.execute(
+            "UPDATE entities SET status = ?, version = version + 1, data = ?, updated_at = ? "
+            "WHERE id = ? AND version = ?",
+            (status, payload, utcnow(), entity_id, current_version),
+        )
+        if cursor.rowcount != 1:
+            raise ConflictError("entity changed concurrently: " + entity_id)
+        return self.get(entity_id)
+
+    def audit(self, entity_id, actor_id, actor_role, action, from_status, to_status, detail):
+        self.connection.execute(
+            "INSERT INTO audit_log(entity_id, actor_id, actor_role, action, from_status, to_status, detail, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                entity_id,
+                actor_id,
+                actor_role,
+                action,
+                from_status,
+                to_status,
+                json.dumps(detail, ensure_ascii=False, sort_keys=True),
+                utcnow(),
+            ),
+        )
 
 
 class SQLiteRepository:
@@ -17,6 +104,10 @@ class SQLiteRepository:
     def _connect(self):
         connection = sqlite3.connect(self.path, timeout=30)
         connection.row_factory = sqlite3.Row
+        # 并发写互斥：WAL 下写者排队等待 busy_timeout，随后由乐观锁裁决输赢，
+        # 保证撤回执行与样本借出同时提交时只有一边成功。
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute("PRAGMA busy_timeout=30000")
         return connection
 
     def _initialize(self):
@@ -68,6 +159,20 @@ class SQLiteRepository:
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
         }
+
+    @contextmanager
+    def unit_of_work(self):
+        """开启 IMMEDIATE 事务：撤回执行与借出等写操作在此互斥。"""
+        connection = self._connect()
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            yield Transaction(connection)
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
 
     def create_entity(self, entity_id, kind, status, data, actor_id):
         now = utcnow()
@@ -127,11 +232,13 @@ class SQLiteRepository:
                     "version conflict: expected %s, found %s"
                     % (expected_version, current_version)
                 )
-            connection.execute(
+            cursor = connection.execute(
                 "UPDATE entities SET status = ?, version = version + 1, data = ?, updated_at = ? "
                 "WHERE id = ? AND version = ?",
                 (status, payload, now, entity_id, current_version),
             )
+            if cursor.rowcount != 1:
+                raise ConflictError("entity changed concurrently: " + entity_id)
             connection.commit()
         except Exception:
             connection.rollback()
